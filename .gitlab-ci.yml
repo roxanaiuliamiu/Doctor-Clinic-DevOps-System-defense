@@ -1,0 +1,116 @@
+stages:
+  - validate
+  - build
+  - test
+  - package
+  - deploy
+
+variables:
+  APP_ENV: testing
+  APP_DEBUG: "true"
+  DB_CONNECTION: sqlite
+  DB_DATABASE: database/database.sqlite
+  COMPOSER_ALLOW_SUPERUSER: "1"
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - vendor/
+    - node_modules/
+
+php_syntax:
+  stage: validate
+  image: php:8.2
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git unzip curl
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - composer install --no-interaction --prefer-dist --optimize-autoloader
+  script:
+    - find app config database routes resources/views tests -name "*.php" -print0 | xargs -0 -n1 php -l
+
+build_frontend:
+  stage: build
+  image: node:20
+  script:
+    - npm ci
+    - npm run build
+  artifacts:
+    paths:
+      - public/build/
+    expire_in: 1 week
+
+test_application:
+  stage: test
+  image: php:8.2
+  needs:
+    - build_frontend
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq git unzip curl libzip-dev libpng-dev libicu-dev libonig-dev libxml2-dev libsqlite3-dev sqlite3
+    - docker-php-ext-install pdo pdo_sqlite mbstring bcmath intl zip
+    - curl -sS https://getcomposer.org/installer | php -- --install-dir=/usr/local/bin --filename=composer
+    - cp .env.example .env
+    - mkdir -p storage/framework/cache storage/framework/sessions storage/framework/views bootstrap/cache database
+    - chmod -R 777 storage bootstrap/cache database
+    - touch database/database.sqlite
+    - composer install --no-interaction --prefer-dist --optimize-autoloader
+    - php artisan key:generate
+    - php artisan migrate --force
+    - php artisan optimize:clear
+  script:
+    - php artisan test
+  artifacts:
+    when: always
+    paths:
+      - public/build/
+      - storage/logs/
+    expire_in: 1 week
+
+package_project:
+  stage: package
+  image: alpine:latest
+  needs:
+    - build_frontend
+    - test_application
+  script:
+    - mkdir -p release
+    - cp -r app bootstrap config database docker k8s monitoring public resources routes scripts storage terraform tests release/ || true
+    - cp .dockerignore .gitignore artisan composer.json composer.lock docker-compose.yml Dockerfile package.json package-lock.json phpunit.xml postcss.config.js README.md tailwind.config.js vite.config.js .gitlab-ci.yml release/ 2>/dev/null || true
+    - tar -czf doctor-clinic-devops-system.tar.gz release
+    - echo "Package created successfully"
+  artifacts:
+    paths:
+      - doctor-clinic-devops-system.tar.gz
+    expire_in: 1 week
+
+deploy_production:
+  stage: deploy
+  image: alpine:latest
+  needs:
+    - package_project
+  before_script:
+    - apk add --no-cache openssh-client bash
+    - mkdir -p ~/.ssh
+    - chmod 700 ~/.ssh
+    - echo "$SSH_PRIVATE_KEY" | base64 -d > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - ssh-keyscan -H $DEPLOY_HOST >> ~/.ssh/known_hosts
+  script:
+    - echo "Deploying to Proxmox VM at $DEPLOY_HOST"
+    - scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no monitoring/prometheus.yml ubuntu@$DEPLOY_HOST:/tmp/prometheus.yml
+    - ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no ubuntu@$DEPLOY_HOST "
+        sudo mv /tmp/prometheus.yml /opt/doctor-clinic/prometheus.yml &&
+        cd /opt/doctor-clinic &&
+        sudo docker stop doktors_prometheus doktors_grafana node_exporter 2>/dev/null || true &&
+        sudo docker rm doktors_prometheus doktors_grafana node_exporter 2>/dev/null || true &&
+        sudo docker compose pull prometheus grafana &&
+        sudo docker compose up -d &&
+        sudo docker run -d --name node_exporter --net=host prom/node-exporter &&
+        sudo docker stop doktors_prometheus 2>/dev/null || true &&
+        sudo docker rm doktors_prometheus 2>/dev/null || true &&
+        sudo docker run -d --name doktors_prometheus --net=host -v /opt/doctor-clinic/prometheus.yml:/etc/prometheus/prometheus.yml prom/prometheus &&
+        sudo docker ps --format 'table {{.Names}}\t{{.Status}}\t{{.Ports}}' &&
+        echo 'Deployment successful!'"
+    - echo "Application live at http://51.158.200.127:8080"
+    - echo "Grafana live at http://51.158.200.127:3000"
+  only:
+    - main
