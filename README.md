@@ -290,7 +290,7 @@ terraform apply
 
 ## Author
 
-**Muhammed Munir Al Tawil**  
+**Muhammed Munir Al Tawil**  **Roxana Miu**
 DevOps – Application Deployment and Lifecycle  
 DataScientest – Sorbonne University Partnership – 2026  
 Mentor: Durrell Gemuh
